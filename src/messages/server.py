@@ -34,6 +34,7 @@ def handle_client(conn: socket.socket, addr: tuple[str, int], cipher: Fernet) ->
     with conn:
         conn.sendall(b"Nome: ")
         name = conn.recv(1024).decode("utf-8", errors="ignore").strip() or "anon"
+        print(f"[+] Cliente ligado: {name} ({addr[0]}:{addr[1]})")
         conn.sendall(b"Mensagem (exit para sair): ")
         while True:
             data = conn.recv(4096)
@@ -42,8 +43,10 @@ def handle_client(conn: socket.socket, addr: tuple[str, int], cipher: Fernet) ->
             text = data.decode("utf-8", errors="ignore").strip()
             if text.lower() == "exit":
                 break
+            print(f"[MSG] {name}@{addr[0]}:{addr[1]} -> {text}")
             append_message(cipher, name, text)
             conn.sendall(b"OK guardado\n")
+        print(f"[-] Cliente desligado: {name} ({addr[0]}:{addr[1]})")
 
 
 def run_server() -> None:
