@@ -1,67 +1,77 @@
-import json
-import pathlib
+#!/usr/bin/env python3
+#
+# MESI - Mestrado em Engenharia de Segurança da Informação 
+# Linguagem de Programação Dinâmica - LPD - Projeto Python
+# Aluno: Paulo Serrano - 710
+#
+# Módulo: server.py - modulo para troca de mensagem segura, lado servidor
+# Exibe o resultao na tela
+# Criado em 06/03/2026
+# Historio de modificacoes:
+#
 import socket
-import threading
-from datetime import datetime
-
+from cryptography.hazmat.primitives.asymmetric import rsa, padding
+from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.fernet import Fernet
 
-BASE_DIR = pathlib.Path(__file__).resolve().parent.parent
-KEY_FILE = BASE_DIR / "messages" / "chat.key"
-STORE_FILE = BASE_DIR / "messages" / "messages_store.enc"
+HOST = "0.0.0.0"
+PORT = 9000
 
+# Geração de chaves RSA
+private_key = rsa.generate_private_key(
+    public_exponent=65537,
+    key_size=2048
+)
+public_key = private_key.public_key()
 
-def load_or_create_key() -> bytes:
-    if KEY_FILE.exists():
-        return KEY_FILE.read_bytes()
-    key = Fernet.generate_key()
-    KEY_FILE.write_bytes(key)
-    return key
+public_pem = public_key.public_bytes(
+    encoding=serialization.Encoding.PEM,
+    format=serialization.PublicFormat.SubjectPublicKeyInfo
+)
 
+print("[+] Servidor seguro iniciado")
 
-def append_message(cipher: Fernet, sender: str, text: str) -> None:
-    payload = {
-        "ts": datetime.now().isoformat(timespec="seconds"),
-        "sender": sender,
-        "text": text,
-    }
-    token = cipher.encrypt(json.dumps(payload).encode("utf-8"))
-    with STORE_FILE.open("ab") as f:
-        f.write(token + b"\n")
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+sock.bind((HOST, PORT))
+sock.listen(1)
 
+conn, addr = sock.accept()
+print(f"[+] Cliente conectado: {addr}")
 
-def handle_client(conn: socket.socket, addr: tuple[str, int], cipher: Fernet) -> None:
-    with conn:
-        conn.sendall(b"Nome: ")
-        name = conn.recv(1024).decode("utf-8", errors="ignore").strip() or "anon"
-        print(f"[+] Cliente ligado: {name} ({addr[0]}:{addr[1]})")
-        conn.sendall(b"Mensagem (exit para sair): ")
-        while True:
-            data = conn.recv(4096)
-            if not data:
-                break
-            text = data.decode("utf-8", errors="ignore").strip()
-            if text.lower() == "exit":
-                break
-            print(f"[MSG] {name}@{addr[0]}:{addr[1]} -> {text}")
-            append_message(cipher, name, text)
-            conn.sendall(b"OK guardado\n")
-        print(f"[-] Cliente desligado: {name} ({addr[0]}:{addr[1]})")
+# Envia chave pública
+conn.sendall(public_pem)
 
+# Recebe chave AES cifrada
+encrypted_aes = conn.recv(256)
+aes_key = private_key.decrypt(
+    encrypted_aes,
+    padding.OAEP(
+        mgf=padding.MGF1(algorithm=hashes.SHA256()),
+        algorithm=hashes.SHA256(),
+        label=None
+    )
+)
 
-def run_server() -> None:
-    host = input("Bind host [0.0.0.0]: ").strip() or "0.0.0.0"
-    port = int(input("Bind port [5050]: ").strip() or "5050")
+cipher = Fernet(aes_key)
+print("[+] Canal seguro estabelecido")
 
-    cipher = Fernet(load_or_create_key())
-    print(f"Servidor ativo em {host}:{port}")
+while True:
+    data = conn.recv(4096)
+    if not data:
+        break
 
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
-        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server.bind((host, port))
-        server.listen(8)
+    message = cipher.decrypt(data).decode()
+    print(f"Cliente: {message}")
 
-        while True:
-            conn, addr = server.accept()
-            th = threading.Thread(target=handle_client, args=(conn, addr, cipher), daemon=True)
-            th.start()
+    if message == "Fim comunicacao":
+        response = cipher.encrypt(b"Comunicacao encerrada pelo servidor")
+        conn.sendall(response)
+        break
+
+    response = cipher.encrypt(f"Recebido: {message}".encode())
+    conn.sendall(response)
+
+conn.close()
+sock.close()
+print("[+] Conexao encerrada com sucesso")
+
