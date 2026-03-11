@@ -1,165 +1,169 @@
-import csv
-import pathlib
+#!/usr/bin/env python3
+#
+# MESI - Mestrado em Engenharia de Segurança da Informação 
+# Linguagem de Programação Dinâmica - LPD - Projeto Python
+# Aluno: Paulo Serrano - 710
+#
+# Módulo: analyzer.py - Analisa arquivo de log fornecido pelo professor ufw.log.
+#
+# Exibe o resultao na tela
+# Criado em 25/02/2026
+# Historio de modificacoes:
+#
 import re
-import sqlite3
-from collections import Counter
-from datetime import datetime
-from urllib.request import urlopen
+import os
+import geoip2.database
+import geoip2.errors
 
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 
-BASE_DIR = pathlib.Path(__file__).resolve().parent.parent
-CSV_PATH = BASE_DIR / "security_events.csv"
-PDF_PATH = BASE_DIR / "security_report.pdf"
-DB_PATH = BASE_DIR / "analiselogs" / "events.db"
+# Caminhos
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+UFW_LOG = os.path.join(BASE_DIR, "ufw.log")
+AUTH_LOG = os.path.join(BASE_DIR, "auth.log")
+GEOIP_DB = os.path.join(BASE_DIR, "GeoLite2-Country.mmdb")
 
-LINE_RE = re.compile(
-    r"^(?P<month>\w{3})\s+(?P<day>\d{1,2})\s+(?P<time>\d\d:\d\d:\d\d).*?\[UFW\s+(?P<action>\w+)\].*?"
-    r"SRC=(?P<src>\S+)\s+DST=(?P<dst>\S+).*?PROTO=(?P<proto>\S+)(?:\s+SPT=(?P<spt>\d+))?(?:\s+DPT=(?P<dpt>\d+))?"
+# Regex UFW
+UFW_PATTERN = re.compile(
+    r'(?P<timestamp>\w{3}\s+\d+\s[\d:]+).*'
+    r'SRC=(?P<src>\S+).*'
+    r'DST=(?P<dst>\S+)'
+    r'(?:.*SPT=(?P<spt>\d+))?'
+    r'(?:.*DPT=(?P<dpt>\d+))?'
 )
 
-COUNTRY_CACHE: dict[str, str] = {}
+# Regex auth.log (SSH)
+AUTH_PATTERN = re.compile(
+    r'(?P<timestamp>\w{3}\s+\d+\s[\d:]+).*'
+    r'(Failed|Accepted).*from\s+(?P<src>\S+)'
+)
 
+# Reader global
+reader = None
+results = []
 
-def country_from_ip(ip: str) -> str:
-    if ip in COUNTRY_CACHE:
-        return COUNTRY_CACHE[ip]
-    try:
-        with urlopen(f"http://ip-api.com/line/{ip}?fields=country", timeout=2) as r:
-            value = r.read().decode("utf-8", errors="ignore").strip() or "Unknown"
-    except Exception:
-        value = "Unknown"
-    COUNTRY_CACHE[ip] = value
-    return value
+import csv
 
+def export_csv(results, filename="security_events.csv"):
+    if not results:
+        return
 
-def parse_line(line: str, year: int) -> dict | None:
-    m = LINE_RE.search(line)
-    if not m:
-        return None
-
-    raw = m.groupdict()
-    ts = datetime.strptime(f"{year} {raw['month']} {raw['day']} {raw['time']}", "%Y %b %d %H:%M:%S")
-    return {
-        "timestamp": ts.isoformat(sep=" "),
-        "action": raw["action"],
-        "src": raw["src"],
-        "dst": raw["dst"],
-        "proto": raw["proto"],
-        "spt": int(raw["spt"] or 0),
-        "dpt": int(raw["dpt"] or 0),
-        "country": country_from_ip(raw["src"]),
-    }
-
-
-def write_csv(events: list[dict], path: pathlib.Path = CSV_PATH) -> None:
-    fields = ["timestamp", "action", "src", "country", "dst", "proto", "spt", "dpt"]
-    with path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fields)
+    with open(filename, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=results[0].keys())
         writer.writeheader()
-        writer.writerows(events)
+        writer.writerows(results)
 
+    print(f"[+] CSV gerado: {filename}")
 
-def write_sqlite(events: list[dict], db_path: pathlib.Path = DB_PATH) -> None:
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(db_path)
-    try:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT,
-                action TEXT,
-                src TEXT,
-                country TEXT,
-                dst TEXT,
-                proto TEXT,
-                spt INTEGER,
-                dpt INTEGER
-            )
-            """
+def generate_pdf(results, filename="security_report.pdf"):
+    c = canvas.Canvas(filename, pagesize=A4)
+    width, height = A4
+
+    y = height - 50
+    c.setFont("Helvetica", 10)
+
+    c.drawString(50, y, "Relatório de Segurança")
+    y -= 30
+
+    for r in results:
+        line = (
+            f"{r['timestamp']} | "
+            f"{r['src_ip']} ({r['country']}) → "
+            f"{r['dst_ip']} | Porta {r['dpt']} | {r['log']}"
         )
-        conn.execute("DELETE FROM events")
-        conn.executemany(
-            "INSERT INTO events(timestamp, action, src, country, dst, proto, spt, dpt) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            [
-                (
-                    e["timestamp"],
-                    e["action"],
-                    e["src"],
-                    e["country"],
-                    e["dst"],
-                    e["proto"],
-                    e["spt"],
-                    e["dpt"],
-                )
-                for e in events
-            ],
-        )
-        conn.commit()
-    finally:
-        conn.close()
 
-
-def write_pdf(summary: dict, pdf_path: pathlib.Path = PDF_PATH) -> None:
-    c = canvas.Canvas(str(pdf_path), pagesize=A4)
-    c.setTitle("Security Report")
-    y = 800
-
-    lines = [
-        "Relatorio de Seguranca - UFW",
-        f"Gerado em: {datetime.now().isoformat(timespec='seconds')}",
-        f"Total de eventos: {summary['total_events']}",
-        "",
-        "Top IPs origem:",
-    ]
-
-    lines.extend([f"- {ip}: {count}" for ip, count in summary["top_sources"]])
-    lines.append("")
-    lines.append("Top portos destino:")
-    lines.extend([f"- {port}: {count}" for port, count in summary["top_dpt"]])
-
-    for line in lines:
         c.drawString(50, y, line)
-        y -= 18
+        y -= 15
+
         if y < 50:
             c.showPage()
-            y = 800
+            c.setFont("Helvetica", 10)
+            y = height - 50
 
     c.save()
+    print(f"[+] PDF gerado: {filename}")
+
+def get_country(ip):
+    try:
+        response = reader.country(ip)
+        return response.country.name
+    except geoip2.errors.AddressNotFoundError:
+        return "Privado/Desconhecido"
+    except Exception:
+        return "Desconhecido"
 
 
-def run_analysis(log_path: str, year: int | None = None) -> dict:
-    year = year or datetime.now().year
-    path = pathlib.Path(log_path)
-    events: list[dict] = []
+def analyze_ufw():
+    print("\n[ Análise de Logs UFW ]\n")
 
-    with path.open("r", encoding="utf-8", errors="ignore") as f:
-        for line in f:
-            parsed = parse_line(line, year)
-            if parsed:
-                events.append(parsed)
+    if not os.path.exists(UFW_LOG):
+        print("ufw.log não encontrado.")
+        return
 
-    top_sources = Counter(e["src"] for e in events).most_common(10)
-    top_dpt = Counter(e["dpt"] for e in events if e["dpt"] > 0).most_common(10)
+    with open(UFW_LOG, "r") as file:
+        for line in file:
+            match = UFW_PATTERN.search(line)
+            if match:
+                timestamp = match.group("timestamp")
+                src_ip = match.group("src")
+                dst_ip = match.group("dst")
+                dpt = match.group("dpt") or "N/A"
+                country = get_country(src_ip)
 
-    summary = {
-        "total_events": len(events),
-        "top_sources": top_sources,
-        "top_dpt": top_dpt,
-        "csv_path": str(CSV_PATH),
-        "pdf_path": str(PDF_PATH),
-        "db_path": str(DB_PATH),
-    }
+                print(f"Timestamp : {timestamp}")
+                print(f"Origem    : {src_ip} ({country})")
+                print(f"Destino   : {dst_ip}")
+                print(f"Porta Dst : {dpt}")
+                print("-" * 40)
 
-    write_csv(events, CSV_PATH)
-    write_sqlite(events, DB_PATH)
-    write_pdf(summary, PDF_PATH)
-    return summary
+                results.append({
+                    "timestamp": timestamp,
+                    "src_ip": src_ip,
+                    "country": country,
+                    "dst_ip": dst_ip,
+                    "dpt": dpt,
+                    "log": "Firewall"
+                })
 
+def analyze_auth():
+    print("\n[ Análise de Logs AUTH (SSH) ]\n")
 
-if __name__ == "__main__":
-    default_log = BASE_DIR.parent / "ufw.log"
-    result = run_analysis(str(default_log))
-    print(result)
+    if not os.path.exists(AUTH_LOG):
+        print("auth.log não encontrado.")
+        return
+
+    with open(AUTH_LOG, "r") as file:
+        for line in file:
+            match = AUTH_PATTERN.search(line)
+            if match:
+                timestamp = match.group("timestamp")
+                src_ip = match.group("src")
+                country = get_country(src_ip)
+
+                status = "Sucesso" if "Accepted" in line else "Falha"
+
+                print(f"Timestamp : {timestamp}")
+                print(f"Origem    : {src_ip} ({country})")
+                print(f"Resultado : {status}")
+                print("-" * 40)
+
+                results.append({
+                    "timestamp": timestamp,
+                    "src_ip": src_ip,
+                    "country": country,
+                    "dst_ip": "N/A",
+                    "dpt": "N/A",
+                    "log": f"Acesso SSH ({status})"
+                })
+
+def run():
+    global reader
+    reader = geoip2.database.Reader(GEOIP_DB)
+
+    analyze_ufw()
+    analyze_auth()
+    export_csv(results)
+    generate_pdf(results)
+    reader.close()
+
